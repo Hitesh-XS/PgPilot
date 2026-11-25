@@ -1,0 +1,64 @@
+name: pgpilot
+
+x-pg-env: &pgenv
+  POSTGRES_PASSWORD: ${PG_PASSWORD:-postgres}
+  REPL_PASSWORD: ${REPL_PASSWORD:-replpass}
+
+services:
+  pg-primary:
+    image: postgres:16
+    environment:
+      <<: *pgenv
+      POSTGRES_DB: app
+    command: >
+      postgres -c wal_level=logical -c max_wal_senders=10
+      -c max_replication_slots=10 -c hot_standby=on
+    ports: ["${PRIMARY_PORT:-5433}:5432"]
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./primary/01-replication.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 3s
+      retries: 30
+
+  pg-replica1:
+    image: postgres:16
+    environment:
+      <<: *pgenv
+      EXTRA_ARGS: ""
+    entrypoint: ["bash", "/replica-entrypoint.sh"]
+    ports: ["${REPLICA1_PORT:-5434}:5432"]
+    cpus: 1.0
+    volumes:
+      - replica1-data:/var/lib/postgresql/data
+      - ./replica/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  pg-replica2:
+    image: postgres:16
+    environment:
+      <<: *pgenv
+      EXTRA_ARGS: "-c recovery_min_apply_delay=${REPLICA2_DELAY:-0}"
+    entrypoint: ["bash", "/replica-entrypoint.sh"]
+    ports: ["${REPLICA2_PORT:-5435}:5432"]
+    cpus: 0.5   # deliberately slower, so learned routing has something to beat later
+    volumes:
+      - replica2-data:/var/lib/postgresql/data
+      - ./replica/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    ports: ["${REDIS_PORT:-6379}:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+volumes:
+  primary-data:
+  replica1-data:
+  replica2-data:
