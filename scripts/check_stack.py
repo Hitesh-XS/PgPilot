@@ -27,15 +27,43 @@ def lsn_to_int(text: str) -> int:
     return (int(hi, 16) << 32) | int(lo, 16)
 
 
+def connect_with_retry(name: str, port: int, timeout: float = 60.0):
+    """Wait for a server that may still be starting up."""
+    start = time.time()
+    while True:
+        try:
+            return psycopg.connect(dsn(port), autocommit=True, connect_timeout=3)
+        except psycopg.OperationalError as e:
+            if time.time() - start > timeout:
+                print(f"{name}: could not connect after {timeout:.0f}s: {e}")
+                return None
+            time.sleep(1)
+
+
 def main() -> int:
     ok = True
-    primary = psycopg.connect(dsn(PORTS["primary"]), autocommit=True)
+    primary = connect_with_retry("primary", PORTS["primary"])
+    if primary is None:
+        return 1
     n = primary.execute("select count(*) from accounts").fetchone()[0]
     print(f"primary ok, accounts rows: {n}")
 
-    streaming = primary.execute(
-        "select count(*) from pg_stat_replication where state='streaming'"
-    ).fetchone()[0]
+    replicas = {}
+    for name in ("replica1", "replica2"):
+        conn = connect_with_retry(name, PORTS[name])
+        if conn is None:
+            ok = False
+        else:
+            replicas[name] = conn
+
+    streaming = 0
+    for _ in range(30):
+        streaming = primary.execute(
+            "select count(*) from pg_stat_replication where state='streaming'"
+        ).fetchone()[0]
+        if streaming == 2:
+            break
+        time.sleep(1)
     print(f"replicas streaming from primary: {streaming}")
     ok &= streaming == 2
 
@@ -44,8 +72,7 @@ def main() -> int:
     ).fetchone()[0]
     target = lsn_to_int(primary.execute("select pg_current_wal_lsn()::text").fetchone()[0])
 
-    for name in ("replica1", "replica2"):
-        replica = psycopg.connect(dsn(PORTS[name]), autocommit=True)
+    for name, replica in replicas.items():
         in_recovery = replica.execute("select pg_is_in_recovery()").fetchone()[0]
         if not in_recovery:
             print(f"{name}: NOT a standby")
